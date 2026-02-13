@@ -1,0 +1,4 @@
+module OpenClawKitPackageTests {
+    header "/Users/dio/Clawd/openclaw-fix/apps/shared/OpenClawKit/.build/arm64-apple-macosx/debug/OpenClawKitPackageTests.build/OpenClawKitPackageTests-Swift.h"
+    requires objc
+}

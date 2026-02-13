@@ -1,21 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../../config/config.js";
-import type { HookHandler } from "../../hooks.js";
 import { makeTempWorkspace, writeWorkspaceFile } from "../../../test-helpers/workspace.js";
 import { createHookEvent } from "../../hooks.js";
-
-// Avoid calling the embedded Pi agent (global command lane); keep this unit test deterministic.
-vi.mock("../../llm-slug-generator.js", () => ({
-  generateSlugViaLLM: vi.fn().mockResolvedValue("simple-math"),
-}));
-
-let handler: HookHandler;
-
-beforeAll(async () => {
-  ({ default: handler } = await import("./handler.js"));
-});
+import handler, { sanitizeForMemory } from "./handler.js";
 
 /**
  * Create a mock session JSONL file with various entry types
@@ -159,58 +148,6 @@ describe("session-memory hook", () => {
     expect(memoryContent).not.toContain("tool_use");
     expect(memoryContent).not.toContain("tool_result");
     expect(memoryContent).not.toContain("search");
-  });
-
-  it("filters out inter-session user messages", async () => {
-    const tempDir = await makeTempWorkspace("openclaw-session-memory-");
-    const sessionsDir = path.join(tempDir, "sessions");
-    await fs.mkdir(sessionsDir, { recursive: true });
-
-    const sessionContent = [
-      JSON.stringify({
-        type: "message",
-        message: {
-          role: "user",
-          content: "Forwarded internal instruction",
-          provenance: { kind: "inter_session", sourceTool: "sessions_send" },
-        },
-      }),
-      JSON.stringify({
-        type: "message",
-        message: { role: "assistant", content: "Acknowledged" },
-      }),
-      JSON.stringify({
-        type: "message",
-        message: { role: "user", content: "External follow-up" },
-      }),
-    ].join("\n");
-    const sessionFile = await writeWorkspaceFile({
-      dir: sessionsDir,
-      name: "test-session.jsonl",
-      content: sessionContent,
-    });
-
-    const cfg: OpenClawConfig = {
-      agents: { defaults: { workspace: tempDir } },
-    };
-
-    const event = createHookEvent("command", "new", "agent:main:main", {
-      cfg,
-      previousSessionEntry: {
-        sessionId: "test-123",
-        sessionFile,
-      },
-    });
-
-    await handler(event);
-
-    const memoryDir = path.join(tempDir, "memory");
-    const files = await fs.readdir(memoryDir);
-    const memoryContent = await fs.readFile(path.join(memoryDir, files[0]), "utf-8");
-
-    expect(memoryContent).not.toContain("Forwarded internal instruction");
-    expect(memoryContent).toContain("assistant: Acknowledged");
-    expect(memoryContent).toContain("user: External follow-up");
   });
 
   it("filters out command messages starting with /", async () => {
@@ -436,5 +373,69 @@ describe("session-memory hook", () => {
     // Both messages should be included
     expect(memoryContent).toContain("user: Only message 1");
     expect(memoryContent).toContain("assistant: Only message 2");
+  });
+});
+
+describe("sanitizeForMemory", () => {
+  it("strips <file> tags with binary content", () => {
+    const input =
+      'user: Check this <file path="audio.ogg" mime="audio/ogg">BINARY_DATA_HERE</file> message';
+    const result = sanitizeForMemory(input);
+    expect(result).toBe("user: Check this [file attachment stripped] message");
+    expect(result).not.toContain("BINARY_DATA_HERE");
+  });
+
+  it("strips multiline <file> tags", () => {
+    const input = `user: Here is a file
+<file path="test.ogg" mime="text/tab-separated-values">
+lots of binary
+data here
+</file>
+assistant: Got it`;
+    const result = sanitizeForMemory(input);
+    expect(result).toContain("[file attachment stripped]");
+    expect(result).toContain("user: Here is a file");
+    expect(result).toContain("assistant: Got it");
+    expect(result).not.toContain("lots of binary");
+  });
+
+  it("strips base64 image data URIs", () => {
+    const longBase64 = "A".repeat(200);
+    const input = `user: Check this image data:image/png;base64,${longBase64} please`;
+    const result = sanitizeForMemory(input);
+    expect(result).toBe("user: Check this image [base64 image stripped] please");
+  });
+
+  it("strips long base64-like sequences", () => {
+    const longBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(
+      10,
+    );
+    const input = `Before ${longBase64} After`;
+    const result = sanitizeForMemory(input);
+    expect(result).toBe("Before [binary data stripped] After");
+  });
+
+  it("removes control characters but preserves normal whitespace", () => {
+    const input = "Hello\x00World\x1FTest\nNewline\tTab";
+    const result = sanitizeForMemory(input);
+    expect(result).toBe("HelloWorldTest\nNewline\tTab");
+  });
+
+  it("preserves normal text content", () => {
+    const input = "user: Hello, how are you?\nassistant: I'm doing great!";
+    const result = sanitizeForMemory(input);
+    expect(result).toBe(input);
+  });
+
+  it("handles empty and null-ish input", () => {
+    expect(sanitizeForMemory("")).toBe("");
+    expect(sanitizeForMemory(null as unknown as string)).toBe(null);
+    expect(sanitizeForMemory(undefined as unknown as string)).toBe(undefined);
+  });
+
+  it("handles multiple file attachments", () => {
+    const input = `<file path="a.ogg">data1</file> text <file path="b.png">data2</file>`;
+    const result = sanitizeForMemory(input);
+    expect(result).toBe("[file attachment stripped] text [file attachment stripped]");
   });
 });

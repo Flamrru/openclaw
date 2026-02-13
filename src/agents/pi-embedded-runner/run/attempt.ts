@@ -29,6 +29,13 @@ import {
 } from "../../channel-tools.js";
 import { resolveOpenClawDocsPath } from "../../docs-path.js";
 import { isTimeoutError } from "../../failover-error.js";
+import {
+  cacheImage,
+  isImageContent,
+  isImageRef,
+  loadCachedImage,
+  type ImageRefContent,
+} from "../../image-cache.js";
 import { resolveModelAuthMode } from "../../model-auth.js";
 import { resolveDefaultModelForAgent } from "../../model-selection.js";
 import {
@@ -67,7 +74,6 @@ import { buildEmbeddedExtensionPaths } from "../extensions.js";
 import { applyExtraParamsToAgent } from "../extra-params.js";
 import {
   logToolSchemasForGoogle,
-  sanitizeAntigravityThinkingBlocks,
   sanitizeSessionHistory,
   sanitizeToolsForGoogle,
 } from "../google.js";
@@ -89,17 +95,24 @@ import {
 } from "../system-prompt.js";
 import { splitSdkTools } from "../tool-split.js";
 import { describeUnknownError, mapThinkingLevel } from "../utils.js";
-import { flushPendingToolResultsAfterIdle } from "../wait-for-idle-before-flush.js";
 import { detectAndLoadPromptImages } from "./images.js";
 
-export function injectHistoryImagesIntoMessages(
+/**
+ * Inject history images into messages as REFERENCES (not base64 data).
+ * Images are cached to disk and only references are stored in the session.
+ * This prevents session file bloat and context overflow.
+ *
+ * @returns Object with didMutate flag and array of cached image refs for later resolution
+ */
+export async function injectHistoryImagesIntoMessages(
   messages: AgentMessage[],
   historyImagesByIndex: Map<number, ImageContent[]>,
-): boolean {
+): Promise<{ didMutate: boolean; cachedRefs: Array<{ msgIndex: number; ref: ImageRefContent }> }> {
   if (historyImagesByIndex.size === 0) {
-    return false;
+    return { didMutate: false, cachedRefs: [] };
   }
   let didMutate = false;
+  const cachedRefs: Array<{ msgIndex: number; ref: ImageRefContent }> = [];
 
   for (const [msgIndex, images] of historyImagesByIndex) {
     // Bounds check: ensure index is valid before accessing
@@ -114,30 +127,95 @@ export function injectHistoryImagesIntoMessages(
         didMutate = true;
       }
       if (Array.isArray(msg.content)) {
-        // Check for existing image content to avoid duplicates across turns
-        const existingImageData = new Set(
-          msg.content
-            .filter(
-              (c): c is ImageContent =>
-                c != null &&
-                typeof c === "object" &&
-                c.type === "image" &&
-                typeof c.data === "string",
-            )
-            .map((c) => c.data),
-        );
+        // Cast to unknown[] since we're working with mixed content types including image_ref
+        const contentArray = msg.content as unknown[];
+
+        // Check for existing image/image_ref content to avoid duplicates
+        const existingCacheIds = new Set(contentArray.filter(isImageRef).map((c) => c.cacheId));
+        const existingImageData = new Set(contentArray.filter(isImageContent).map((c) => c.data));
+
         for (const img of images) {
-          // Only add if this image isn't already in the message
-          if (!existingImageData.has(img.data)) {
-            msg.content.push(img);
-            didMutate = true;
+          // Skip if this exact image data is already in the message
+          if (existingImageData.has(img.data)) {
+            continue;
           }
+
+          // Cache the image and store only a reference
+          const ref = await cacheImage(img);
+
+          // Skip if we already have a ref with this cache ID
+          if (existingCacheIds.has(ref.cacheId)) {
+            continue;
+          }
+
+          // Store the reference (not the base64 data) in the message
+          contentArray.push(ref);
+          cachedRefs.push({ msgIndex, ref });
+          didMutate = true;
         }
       }
     }
   }
 
-  return didMutate;
+  return { didMutate, cachedRefs };
+}
+
+/**
+ * Resolve image references in messages to actual image content for model prompting.
+ * This loads cached images from disk right before sending to the model.
+ *
+ * @param messages The messages array (may contain image_ref blocks)
+ * @returns New messages array with image_ref resolved to image (for model consumption only)
+ */
+export async function resolveImageRefsForPrompt(messages: AgentMessage[]): Promise<AgentMessage[]> {
+  const resolved: AgentMessage[] = [];
+
+  for (const msg of messages) {
+    // Only process messages with role property (user/assistant messages have content)
+    if (!("role" in msg) || !("content" in msg)) {
+      resolved.push(msg);
+      continue;
+    }
+
+    if (!Array.isArray(msg.content)) {
+      resolved.push(msg);
+      continue;
+    }
+
+    // Cast to unknown[] since content may contain image_ref blocks
+    const contentArray = msg.content as unknown[];
+    const resolvedContent: unknown[] = [];
+    let hasRefs = false;
+
+    for (const block of contentArray) {
+      if (isImageRef(block)) {
+        hasRefs = true;
+        const image = await loadCachedImage(block);
+        if (image) {
+          resolvedContent.push(image);
+        } else {
+          // Cache miss - add placeholder text
+          resolvedContent.push({
+            type: "text",
+            text: "[Image no longer available]",
+          });
+        }
+      } else {
+        resolvedContent.push(block);
+      }
+    }
+
+    if (hasRefs) {
+      // Create new message with resolved content
+      // Use type assertion since we're replacing image_ref blocks with image blocks
+      const resolvedMsg = { ...msg, content: resolvedContent } as AgentMessage;
+      resolved.push(resolvedMsg);
+    } else {
+      resolved.push(msg);
+    }
+  }
+
+  return resolved;
 }
 
 export async function runEmbeddedAttempt(
@@ -429,7 +507,6 @@ export async function runEmbeddedAttempt(
       sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), {
         agentId: sessionAgentId,
         sessionKey: params.sessionKey,
-        inputProvenance: params.inputProvenance,
         allowSyntheticToolResults: transcriptPolicy.allowSyntheticToolResults,
       });
       trackSessionManagerAccess(params.sessionFile);
@@ -456,9 +533,6 @@ export async function runEmbeddedAttempt(
         modelId: params.modelId,
         model: params.model,
       });
-
-      // Get hook runner early so it's available when creating tools
-      const hookRunner = getGlobalHookRunner();
 
       const { builtInTools, customTools } = splitSdkTools({
         tools,
@@ -578,10 +652,7 @@ export async function runEmbeddedAttempt(
           activeSession.agent.replaceMessages(limited);
         }
       } catch (err) {
-        await flushPendingToolResultsAfterIdle({
-          agent: activeSession?.agent,
-          sessionManager,
-        });
+        sessionManager.flushPendingToolResults?.();
         activeSession.dispose();
         throw err;
       }
@@ -640,7 +711,6 @@ export async function runEmbeddedAttempt(
       const subscription = subscribeEmbeddedPiSession({
         session: activeSession,
         runId: params.runId,
-        hookRunner: getGlobalHookRunner() ?? undefined,
         verboseLevel: params.verboseLevel,
         reasoningMode: params.reasoningLevel ?? "off",
         toolResultFormat: params.toolResultFormat,
@@ -724,7 +794,8 @@ export async function runEmbeddedAttempt(
         }
       }
 
-      // Hook runner was already obtained earlier before tool creation
+      // Get hook runner once for both before_agent_start and agent_end hooks
+      const hookRunner = getGlobalHookRunner();
       const hookAgentId =
         typeof params.agentId === "string" && params.agentId.trim()
           ? normalizeAgentId(params.agentId)
@@ -779,10 +850,7 @@ export async function runEmbeddedAttempt(
             sessionManager.resetLeaf();
           }
           const sessionContext = sessionManager.buildSessionContext();
-          const sanitizedOrphan = transcriptPolicy.normalizeAntigravityThinkingBlocks
-            ? sanitizeAntigravityThinkingBlocks(sessionContext.messages)
-            : sessionContext.messages;
-          activeSession.agent.replaceMessages(sanitizedOrphan);
+          activeSession.agent.replaceMessages(sessionContext.messages);
           log.warn(
             `Removed orphaned user message to prevent consecutive user turns. ` +
               `runId=${params.runId} sessionId=${params.sessionId}`,
@@ -808,22 +876,43 @@ export async function runEmbeddedAttempt(
                 : undefined,
           });
 
-          // Inject history images into their original message positions.
-          // This ensures the model sees images in context (e.g., "compare to the first image").
-          const didMutate = injectHistoryImagesIntoMessages(
+          // Inject history images into their original message positions as REFS.
+          // These refs will be resolved to actual images right before prompting,
+          // then converted back to refs after the prompt for session persistence.
+          // This prevents session file bloat from base64 image data.
+          await injectHistoryImagesIntoMessages(
             activeSession.messages,
             imageResult.historyImagesByIndex,
           );
-          if (didMutate) {
-            // Persist message mutations (e.g., injected history images) so we don't re-scan/reload.
-            activeSession.agent.replaceMessages(activeSession.messages);
-          }
+          // Note: We don't call replaceMessages here - persistence happens after
+          // the prompt when all images have been converted to refs.
 
           cacheTrace?.recordStage("prompt:images", {
             prompt: effectivePrompt,
             messages: activeSession.messages,
             note: `images: prompt=${imageResult.images.length} history=${imageResult.historyImagesByIndex.size}`,
           });
+
+          const shouldTrackCacheTtl =
+            params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl" &&
+            isCacheTtlEligibleProvider(params.provider, params.modelId);
+          if (shouldTrackCacheTtl) {
+            appendCacheTtlTimestamp(sessionManager, {
+              timestamp: Date.now(),
+              provider: params.provider,
+              modelId: params.modelId,
+            });
+          }
+
+          // Before prompting, resolve any image_ref blocks to actual images.
+          // The model API doesn't understand image_ref - it needs base64 image data.
+          // After prompting, we'll convert images back to refs for session persistence.
+          const messagesBeforePrompt = activeSession.messages;
+          const resolvedMessages = await resolveImageRefsForPrompt(messagesBeforePrompt);
+
+          // Temporarily replace messages with resolved versions
+          activeSession.messages.length = 0;
+          activeSession.messages.push(...resolvedMessages);
 
           // Only pass images option if there are actually images to pass
           // This avoids potential issues with models that don't expect the images parameter
@@ -838,6 +927,31 @@ export async function runEmbeddedAttempt(
           log.debug(
             `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
           );
+
+          // Convert images to refs in finally block so it runs even on context overflow.
+          // Without this, a prompt overflow leaves base64 images in the session,
+          // causing repeated overflows on every subsequent prompt (death spiral).
+          try {
+            let didCacheImages = false;
+            for (const msg of activeSession.messages) {
+              if (!("content" in msg) || !Array.isArray(msg.content)) {
+                continue;
+              }
+              const contentArray = msg.content as unknown[];
+              for (let i = 0; i < contentArray.length; i++) {
+                const block = contentArray[i];
+                if (isImageContent(block)) {
+                  contentArray[i] = await cacheImage(block);
+                  didCacheImages = true;
+                }
+              }
+            }
+            if (didCacheImages || !promptError) {
+              activeSession.agent.replaceMessages(activeSession.messages);
+            }
+          } catch (cacheErr) {
+            log.debug(`image caching after prompt failed: ${String(cacheErr)}`);
+          }
         }
 
         try {
@@ -850,22 +964,6 @@ export async function runEmbeddedAttempt(
           } else {
             throw err;
           }
-        }
-
-        // Append cache-TTL timestamp AFTER prompt + compaction retry completes.
-        // Previously this was before the prompt, which caused a custom entry to be
-        // inserted between compaction and the next prompt — breaking the
-        // prepareCompaction() guard that checks the last entry type, leading to
-        // double-compaction. See: https://github.com/openclaw/openclaw/issues/9282
-        const shouldTrackCacheTtl =
-          params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl" &&
-          isCacheTtlEligibleProvider(params.provider, params.modelId);
-        if (shouldTrackCacheTtl) {
-          appendCacheTtlTimestamp(sessionManager, {
-            timestamp: Date.now(),
-            provider: params.provider,
-            modelId: params.modelId,
-          });
         }
 
         messagesSnapshot = activeSession.messages.slice();
@@ -944,17 +1042,7 @@ export async function runEmbeddedAttempt(
       };
     } finally {
       // Always tear down the session (and release the lock) before we leave this attempt.
-      //
-      // BUGFIX: Wait for the agent to be truly idle before flushing pending tool results.
-      // pi-agent-core's auto-retry resolves waitForRetry() on assistant message receipt,
-      // *before* tool execution completes in the retried agent loop. Without this wait,
-      // flushPendingToolResults() fires while tools are still executing, inserting
-      // synthetic "missing tool result" errors and causing silent agent failures.
-      // See: https://github.com/openclaw/openclaw/issues/8643
-      await flushPendingToolResultsAfterIdle({
-        agent: session?.agent,
-        sessionManager,
-      });
+      sessionManager?.flushPendingToolResults?.();
       session?.dispose();
       await sessionLock.release();
     }

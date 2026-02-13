@@ -14,11 +14,57 @@ import { resolveAgentWorkspaceDir } from "../../../agents/agent-scope.js";
 import { resolveStateDir } from "../../../config/paths.js";
 import { createSubsystemLogger } from "../../../logging/subsystem.js";
 import { resolveAgentIdFromSessionKey } from "../../../routing/session-key.js";
-import { hasInterSessionUserProvenance } from "../../../sessions/input-provenance.js";
 import { resolveHookConfig } from "../../config.js";
 import { generateSlugViaLLM } from "../../llm-slug-generator.js";
 
 const log = createSubsystemLogger("hooks/session-memory");
+
+/**
+ * Sanitize content for memory files by stripping binary data and file attachments.
+ * This prevents context overflow from embedded audio, images, or other binary content.
+ *
+ * Strips:
+ * - <file>...</file> tags (may contain binary audio/image data)
+ * - Base64 image data patterns
+ * - Long sequences of non-printable characters
+ */
+export function sanitizeForMemory(text: string): string;
+export function sanitizeForMemory(text: null): null;
+export function sanitizeForMemory(text: undefined): undefined;
+export function sanitizeForMemory(text: string | null | undefined): string | null | undefined;
+export function sanitizeForMemory(text: string | null | undefined): string | null | undefined {
+  if (!text) {
+    return text;
+  }
+
+  let result = text;
+
+  // Strip <file>...</file> tags (may contain binary audio/image data)
+  // These tags are used for embedded file content in session transcripts
+  result = result.replace(/<file[^>]*>[\s\S]*?<\/file>/gi, "[file attachment stripped]");
+
+  // Strip base64 image data patterns (data:image/... or long base64 sequences)
+  result = result.replace(
+    /data:image\/[^;]+;base64,[A-Za-z0-9+/=]{100,}/g,
+    "[base64 image stripped]",
+  );
+
+  // Strip any remaining long base64-like sequences (>500 chars of base64 alphabet)
+  result = result.replace(/[A-Za-z0-9+/=]{500,}/g, "[binary data stripped]");
+
+  // Remove non-printable characters except common whitespace (newline, tab, carriage return)
+  // This catches any binary data that leaked through as raw bytes
+  // eslint-disable-next-line no-control-regex
+  result = result.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "");
+
+  // If result is mostly replacement placeholders or very short after stripping, note it
+  const strippedCount = (result.match(/\[.*?stripped\]/g) || []).length;
+  if (strippedCount > 5) {
+    log.debug("Stripped binary/file attachments from content", { strippedCount });
+  }
+
+  return result;
+}
 
 /**
  * Read recent messages from session file for slug generation
@@ -41,9 +87,6 @@ async function getRecentSessionContent(
           const msg = entry.message;
           const role = msg.role;
           if ((role === "user" || role === "assistant") && msg.content) {
-            if (role === "user" && hasInterSessionUserProvenance(msg)) {
-              continue;
-            }
             // Extract text content
             const text = Array.isArray(msg.content)
               ? // oxlint-disable-next-line typescript/no-explicit-any
@@ -121,20 +164,25 @@ const saveSessionToMemory: HookHandler = async (event) => {
     if (sessionFile) {
       // Get recent conversation content
       sessionContent = await getRecentSessionContent(sessionFile, messageCount);
+      // Sanitize to remove binary data, file attachments, and base64 images
+      // This prevents context overflow from embedded audio/image data
+      if (sessionContent) {
+        const originalLength = sessionContent.length;
+        sessionContent = sanitizeForMemory(sessionContent);
+        if (sessionContent.length !== originalLength) {
+          log.debug("Sanitized session content", {
+            originalLength,
+            newLength: sessionContent.length,
+          });
+        }
+      }
       log.debug("Session content loaded", {
         length: sessionContent?.length ?? 0,
         messageCount,
       });
 
-      // Avoid calling the model provider in unit tests; keep hooks fast and deterministic.
-      const isTestEnv =
-        process.env.OPENCLAW_TEST_FAST === "1" ||
-        process.env.VITEST === "true" ||
-        process.env.VITEST === "1" ||
-        process.env.NODE_ENV === "test";
-      const allowLlmSlug = !isTestEnv && hookConfig?.llmSlug !== false;
-
-      if (sessionContent && cfg && allowLlmSlug) {
+      // Avoid calling the model provider in unit tests, keep hooks fast and deterministic.
+      if (sessionContent && cfg && !process.env.VITEST && process.env.NODE_ENV !== "test") {
         log.debug("Calling generateSlugViaLLM...");
         // Use LLM to generate a descriptive slug
         slug = await generateSlugViaLLM({ sessionContent, cfg });

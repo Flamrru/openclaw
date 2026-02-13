@@ -1,0 +1,4 @@
+module OpenClawChatUI {
+    header "/Users/dio/Clawd/openclaw-fix/apps/shared/OpenClawKit/.build/arm64-apple-macosx/debug/OpenClawChatUI.build/OpenClawChatUI-Swift.h"
+    requires objc
+}

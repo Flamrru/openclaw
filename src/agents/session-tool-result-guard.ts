@@ -2,6 +2,7 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { TextContent } from "@mariozechner/pi-ai";
 import type { SessionManager } from "@mariozechner/pi-coding-agent";
 import { emitSessionTranscriptUpdate } from "../sessions/transcript-events.js";
+import { cacheImageSync, isImageContent } from "./image-cache.js";
 import { HARD_MAX_TOOL_RESULT_CHARS } from "./pi-embedded-runner/tool-result-truncation.js";
 import { makeMissingToolResult, sanitizeToolCallInputs } from "./session-transcript-repair.js";
 
@@ -71,6 +72,44 @@ function capToolResultSize(msg: AgentMessage): AgentMessage {
   return { ...msg, content: newContent } as AgentMessage;
 }
 
+/**
+ * Replace base64 image content blocks with cached image_ref blocks (synchronous).
+ * This prevents large base64 data from being persisted to the session JSONL file.
+ * The images are written to ~/.openclaw/image-cache/ and replaced with small refs.
+ */
+function replaceImagesWithRefsSync(msg: AgentMessage): AgentMessage {
+  const content = (msg as { content?: unknown }).content;
+  if (!Array.isArray(content)) {
+    return msg;
+  }
+
+  let hasImages = false;
+  for (const block of content) {
+    if (isImageContent(block)) {
+      hasImages = true;
+      break;
+    }
+  }
+
+  if (!hasImages) {
+    return msg;
+  }
+
+  const newContent = content.map((block: unknown) => {
+    if (isImageContent(block)) {
+      try {
+        return cacheImageSync(block);
+      } catch {
+        // If sync caching fails, keep the original block rather than losing data
+        return block;
+      }
+    }
+    return block;
+  });
+
+  return { ...msg, content: newContent } as AgentMessage;
+}
+
 type ToolCall = { id: string; name?: string };
 
 function extractAssistantToolCalls(msg: Extract<AgentMessage, { role: "assistant" }>): ToolCall[] {
@@ -114,10 +153,6 @@ export function installSessionToolResultGuard(
   sessionManager: SessionManager,
   opts?: {
     /**
-     * Optional transform applied to any message before persistence.
-     */
-    transformMessageForPersistence?: (message: AgentMessage) => AgentMessage;
-    /**
      * Optional, synchronous transform applied to toolResult messages *before* they are
      * persisted to the session transcript.
      */
@@ -137,10 +172,6 @@ export function installSessionToolResultGuard(
 } {
   const originalAppend = sessionManager.appendMessage.bind(sessionManager);
   const pending = new Map<string, string | undefined>();
-  const persistMessage = (message: AgentMessage) => {
-    const transformer = opts?.transformMessageForPersistence;
-    return transformer ? transformer(message) : message;
-  };
 
   const persistToolResult = (
     message: AgentMessage,
@@ -160,7 +191,7 @@ export function installSessionToolResultGuard(
       for (const [id, name] of pending.entries()) {
         const synthetic = makeMissingToolResult({ toolCallId: id, toolName: name });
         originalAppend(
-          persistToolResult(persistMessage(synthetic), {
+          persistToolResult(synthetic, {
             toolCallId: id,
             toolName: name,
             isSynthetic: true,
@@ -192,9 +223,11 @@ export function installSessionToolResultGuard(
       if (id) {
         pending.delete(id);
       }
+      // Replace base64 images with cached refs before writing to JSONL.
+      const deimaged = replaceImagesWithRefsSync(nextMessage);
       // Apply hard size cap before persistence to prevent oversized tool results
       // from consuming the entire context window on subsequent LLM calls.
-      const capped = capToolResultSize(persistMessage(nextMessage));
+      const capped = capToolResultSize(deimaged);
       return originalAppend(
         persistToolResult(capped, {
           toolCallId: id ?? undefined,
@@ -220,7 +253,12 @@ export function installSessionToolResultGuard(
       }
     }
 
-    const result = originalAppend(persistMessage(nextMessage) as never);
+    // Replace base64 images with cached refs before writing to JSONL.
+    // This prevents massive base64 strings from bloating the session file
+    // and causing context overflow on subsequent loads.
+    nextMessage = replaceImagesWithRefsSync(nextMessage);
+
+    const result = originalAppend(nextMessage as never);
 
     const sessionFile = (
       sessionManager as { getSessionFile?: () => string | null }

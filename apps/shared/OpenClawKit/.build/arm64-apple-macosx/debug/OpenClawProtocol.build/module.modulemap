@@ -1,0 +1,4 @@
+module OpenClawProtocol {
+    header "/Users/dio/Clawd/openclaw-fix/apps/shared/OpenClawKit/.build/arm64-apple-macosx/debug/OpenClawProtocol.build/OpenClawProtocol-Swift.h"
+    requires objc
+}
