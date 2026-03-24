@@ -20,6 +20,13 @@ describe("resolveOutboundSessionRoute", () => {
         },
       },
     } as OpenClawConfig;
+    const channelLinksCfg = {
+      session: {
+        channelLinks: {
+          release: ["slack:channel:C123", "telegram:group:-100123456"],
+        },
+      },
+    } as OpenClawConfig;
     const slackMpimCfg = {
       channels: {
         slack: {
@@ -149,6 +156,25 @@ describe("resolveOutboundSessionRoute", () => {
         target: "user:123",
         expected: {
           sessionKey: "agent:main:direct:alice",
+        },
+      },
+      {
+        name: "channel-links shared channel",
+        cfg: channelLinksCfg,
+        channel: "slack",
+        target: "channel:C123",
+        expected: {
+          sessionKey: "agent:main:linked:release",
+        },
+      },
+      {
+        name: "channel-links shared group",
+        cfg: channelLinksCfg,
+        channel: "telegram",
+        target: "-100123456",
+        expected: {
+          sessionKey: "agent:main:linked:release",
+          chatType: "group",
         },
       },
       {

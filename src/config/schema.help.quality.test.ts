@@ -129,6 +129,7 @@ const TARGET_KEYS = [
   "session.scope",
   "session.dmScope",
   "session.identityLinks",
+  "session.channelLinks",
   "session.resetTriggers",
   "session.idleMinutes",
   "session.reset",

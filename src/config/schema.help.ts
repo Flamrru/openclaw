@@ -1118,6 +1118,8 @@ export const FIELD_HELP: Record<string, string> = {
     'DM session scoping: "main" keeps continuity, while "per-peer", "per-channel-peer", and "per-account-channel-peer" increase isolation. Use isolated modes for shared inboxes or multi-account deployments.',
   "session.identityLinks":
     "Maps canonical identities to provider-prefixed peer IDs so equivalent users resolve to one DM thread (example: telegram:123456). Use this when the same human appears across multiple channels or accounts.",
+  "session.channelLinks":
+    "Maps canonical shared sessions to provider-prefixed channel peers using channel:peerKind:peerId entries (example: slack:channel:C123). Use this when the same room or group exists across multiple providers and should share one session.",
   "session.resetTriggers":
     "Lists message triggers that force a session reset when matched in inbound content. Use sparingly for explicit reset phrases so context is not dropped unexpectedly during normal conversation.",
   "session.idleMinutes":

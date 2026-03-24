@@ -132,6 +132,7 @@ export function buildAgentPeerSessionKey(params: {
   peerKind?: ChatType | null;
   peerId?: string | null;
   identityLinks?: Record<string, string[]>;
+  channelLinks?: Record<string, string[]>;
   /** DM session scope. */
   dmScope?: "main" | "per-peer" | "per-channel-peer" | "per-account-channel-peer";
 }): string {
@@ -170,38 +171,37 @@ export function buildAgentPeerSessionKey(params: {
   }
   const channel = (params.channel ?? "").trim().toLowerCase() || "unknown";
   const peerId = ((params.peerId ?? "").trim() || "unknown").toLowerCase();
+  const linkedSessionName = resolveLinkedChannelName({
+    channelLinks: params.channelLinks,
+    channel,
+    peerKind,
+    peerId,
+  });
+  if (linkedSessionName) {
+    return `agent:${normalizeAgentId(params.agentId)}:linked:${linkedSessionName.toLowerCase()}`;
+  }
   return `agent:${normalizeAgentId(params.agentId)}:${channel}:${peerKind}:${peerId}`;
 }
 
-function resolveLinkedPeerId(params: {
-  identityLinks?: Record<string, string[]>;
-  channel: string;
-  peerId: string;
+function resolveLinkedCanonicalName(params: {
+  links?: Record<string, string[]>;
+  candidates: Iterable<string>;
 }): string | null {
-  const identityLinks = params.identityLinks;
-  if (!identityLinks) {
+  const links = params.links;
+  if (!links) {
     return null;
   }
-  const peerId = params.peerId.trim();
-  if (!peerId) {
-    return null;
-  }
-  const candidates = new Set<string>();
-  const rawCandidate = normalizeToken(peerId);
-  if (rawCandidate) {
-    candidates.add(rawCandidate);
-  }
-  const channel = normalizeToken(params.channel);
-  if (channel) {
-    const scopedCandidate = normalizeToken(`${channel}:${peerId}`);
-    if (scopedCandidate) {
-      candidates.add(scopedCandidate);
+  const normalizedCandidates = new Set<string>();
+  for (const candidate of params.candidates) {
+    const normalized = normalizeToken(candidate);
+    if (normalized) {
+      normalizedCandidates.add(normalized);
     }
   }
-  if (candidates.size === 0) {
+  if (normalizedCandidates.size === 0) {
     return null;
   }
-  for (const [canonical, ids] of Object.entries(identityLinks)) {
+  for (const [canonical, ids] of Object.entries(links)) {
     const canonicalName = canonical.trim();
     if (!canonicalName) {
       continue;
@@ -211,12 +211,60 @@ function resolveLinkedPeerId(params: {
     }
     for (const id of ids) {
       const normalized = normalizeToken(id);
-      if (normalized && candidates.has(normalized)) {
+      if (normalized && normalizedCandidates.has(normalized)) {
         return canonicalName;
       }
     }
   }
   return null;
+}
+
+function resolveLinkedPeerId(params: {
+  identityLinks?: Record<string, string[]>;
+  channel: string;
+  peerId: string;
+}): string | null {
+  const peerId = params.peerId.trim();
+  if (!peerId) {
+    return null;
+  }
+  const candidates: string[] = [];
+  const rawCandidate = normalizeToken(peerId);
+  if (rawCandidate) {
+    candidates.push(rawCandidate);
+  }
+  const channel = normalizeToken(params.channel);
+  if (channel) {
+    const scopedCandidate = normalizeToken(`${channel}:${peerId}`);
+    if (scopedCandidate) {
+      candidates.push(scopedCandidate);
+    }
+  }
+  return resolveLinkedCanonicalName({
+    links: params.identityLinks,
+    candidates,
+  });
+}
+
+function resolveLinkedChannelName(params: {
+  channelLinks?: Record<string, string[]>;
+  channel: string;
+  peerKind: ChatType;
+  peerId: string;
+}): string | null {
+  const peerId = params.peerId.trim();
+  if (!peerId) {
+    return null;
+  }
+  const channel = normalizeToken(params.channel);
+  const peerKind = normalizeToken(params.peerKind);
+  if (!channel || !peerKind) {
+    return null;
+  }
+  return resolveLinkedCanonicalName({
+    links: params.channelLinks,
+    candidates: [`${channel}:${peerKind}:${peerId}`],
+  });
 }
 
 export function buildGroupHistoryKey(params: {

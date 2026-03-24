@@ -127,6 +127,32 @@ describe("resolveAgentRoute", () => {
     }
   });
 
+  test("channelLinks applies to shared group and channel sessions", () => {
+    const cfg: OpenClawConfig = {
+      session: {
+        channelLinks: {
+          release: ["slack:channel:C123", "telegram:group:-100123456"],
+        },
+      },
+    };
+
+    const slackRoute = resolveAgentRoute({
+      cfg,
+      channel: "slack",
+      accountId: null,
+      peer: { kind: "channel", id: "C123" },
+    });
+    expect(slackRoute.sessionKey).toBe("agent:main:linked:release");
+
+    const telegramRoute = resolveAgentRoute({
+      cfg,
+      channel: "telegram",
+      accountId: null,
+      peer: { kind: "group", id: "-100123456" },
+    });
+    expect(telegramRoute.sessionKey).toBe("agent:main:linked:release");
+  });
+
   test("peer binding wins over account binding", () => {
     const cfg: OpenClawConfig = {
       bindings: [

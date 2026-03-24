@@ -108,6 +108,8 @@ export type SessionConfig = {
   dmScope?: DmScope;
   /** Map platform-prefixed identities (e.g. "telegram:123") to canonical DM peers. */
   identityLinks?: Record<string, string[]>;
+  /** Map channel/group peers (for example, "slack:channel:C123") to canonical shared sessions. */
+  channelLinks?: Record<string, string[]>;
   resetTriggers?: string[];
   idleMinutes?: number;
   reset?: SessionResetConfig;
